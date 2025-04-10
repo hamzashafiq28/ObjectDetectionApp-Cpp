@@ -327,7 +327,6 @@
 
 
 
-
 #include <windows.h>
 #include <commctrl.h>
 #include <string>
@@ -342,8 +341,9 @@
 #define IDC_IMAGE  103
 
 HWND hImageWnd;
-std::string imagePath;
-cv::Mat currentImage;
+std::string videoPath;
+cv::VideoCapture cap;
+bool isDetecting = false;
 
 std::string FixPath(const std::string& path) {
     std::string fixedPath = path;
@@ -354,11 +354,7 @@ std::string FixPath(const std::string& path) {
         }
     }
     return fixedPath;
-
 }
-
-
-
 
 std::string GetExecutableDirectory() {
     wchar_t exePath[MAX_PATH];
@@ -376,20 +372,54 @@ std::string GetExecutableDirectory() {
 void UpdateImageDisplay(HWND hwnd, const cv::Mat& img) {
     if (img.empty()) return;
 
-    // Convert OpenCV Mat to HBITMAP
     BITMAPINFOHEADER bi = { sizeof(BITMAPINFOHEADER), img.cols, -img.rows, 1, 24, BI_RGB, 0, 0, 0, 0, 0 };
     HDC hdc = GetDC(hwnd);
     HBITMAP hBitmap = CreateDIBitmap(hdc, &bi, CBM_INIT, img.data, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
     ReleaseDC(hwnd, hdc);
 
-    // Set bitmap to static control
     SendMessage(hImageWnd, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM)hBitmap);
 
-    // Clean up old bitmap if exists
     HBITMAP hOldBitmap = (HBITMAP)SendMessage(hImageWnd, STM_GETIMAGE, 0, 0);
     if (hOldBitmap && hOldBitmap != hBitmap) DeleteObject(hOldBitmap);
+}
 
-    currentImage = img.clone();
+void ProcessVideoFrame(HWND hwnd) {
+    if (!cap.isOpened() || !isDetecting) return;
+
+    cv::Mat frame;
+    if (!cap.read(frame)) {
+        isDetecting = false; // End of video
+        cap.release();
+        SetWindowTextW(GetDlgItem(hwnd, IDC_DETECT), L"Detect");
+        return;
+    }
+
+    cv::resize(frame, frame, cv::Size(640, 640));
+
+    // Save frame temporarily to process with DetectObjects
+    std::string tempPath = GetExecutableDirectory() + "temp_frame.jpg";
+    cv::imwrite(tempPath, frame);
+
+    DetectionResult* results = nullptr;
+    int resultCount = 0;
+    bool success = DetectObjects(tempPath.c_str(), &results, &resultCount);
+
+    if (success && resultCount > 0) {
+        for (int i = 0; i < resultCount; i++) {
+            int x = results[i].x;
+            int y = results[i].y;
+            int w = results[i].width;
+            int h = results[i].height;
+            cv::rectangle(frame, cv::Point(x, y), cv::Point(x + w, y + h), cv::Scalar(0, 255, 0), 2);
+        }
+        if (results) delete[] results;
+    }
+
+    DeleteFileA(tempPath.c_str());
+    UpdateImageDisplay(hwnd, frame);
+
+    // Schedule next frame
+    SetTimer(hwnd, 1, 33, NULL); // ~30 FPS
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -414,59 +444,53 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ofn.hwndOwner = hwnd;
             ofn.lpstrFile = szFile;
             ofn.nMaxFile = MAX_PATH;
-            ofn.lpstrFilter = L"Image Files\0*.jpg;*.png\0All Files\0*.*\0";
+            ofn.lpstrFilter = L"Video Files\0*.mp4;*.avi\0All Files\0*.*\0";
             ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
             if (GetOpenFileNameW(&ofn)) {
                 char narrowPath[MAX_PATH];
                 WideCharToMultiByte(CP_ACP, 0, szFile, -1, narrowPath, MAX_PATH, NULL, NULL);
-                imagePath = FixPath(narrowPath);
+                videoPath = FixPath(narrowPath);
 
-                cv::Mat img = cv::imread(imagePath, cv::IMREAD_COLOR);
-                if (!img.empty()) {
-                    cv::resize(img, img, cv::Size(640, 640));
-                    UpdateImageDisplay(hwnd, img);
+                if (cap.isOpened()) cap.release();
+                cap.open(videoPath);
+                if (!cap.isOpened()) {
+                    MessageBoxW(hwnd, L"Failed to load video!", L"Error", MB_OK | MB_ICONERROR);
                 }
                 else {
-                    MessageBoxW(hwnd, L"Failed to load image!", L"Error", MB_OK | MB_ICONERROR);
+                    cv::Mat frame;
+                    cap.read(frame);
+                    cv::resize(frame, frame, cv::Size(640, 640));
+                    UpdateImageDisplay(hwnd, frame);
                 }
             }
             break;
         }
         case IDC_DETECT: {
-            if (imagePath.empty() || currentImage.empty()) {
-                MessageBoxW(hwnd, L"Please load an image first!", L"Error", MB_OK);
+            if (!cap.isOpened()) {
+                MessageBoxW(hwnd, L"Please load a video first!", L"Error", MB_OK);
                 break;
             }
-
-            DetectionResult* results = nullptr;
-            int resultCount = 0;
-            bool success = DetectObjects(imagePath.c_str(), &results, &resultCount);
-
-            if (!success || resultCount == 0) {
-                MessageBoxW(hwnd, L"No drone detections found!", L"Info", MB_OK);
-                if (results) delete[] results;
-                break;
+            isDetecting = !isDetecting; // Toggle detection
+            if (isDetecting) {
+                SetTimer(hwnd, 1, 33, NULL); // Start processing at ~30 FPS
+                SetWindowTextW(GetDlgItem(hwnd, IDC_DETECT), L"Stop");
             }
-
-            // Draw bounding box on the current image
-            cv::Mat img = currentImage.clone();
-            for (int i = 0; i < resultCount; i++) {
-                int x = results[i].x;
-                int y = results[i].y;
-                int w = results[i].width;
-                int h = results[i].height;
-                cv::rectangle(img, cv::Point(x, y), cv::Point(x + w, y + h), cv::Scalar(0, 255, 0), 2);
+            else {
+                KillTimer(hwnd, 1);
+                SetWindowTextW(GetDlgItem(hwnd, IDC_DETECT), L"Detect");
             }
-
-            UpdateImageDisplay(hwnd, img);
-
-            if (results) delete[] results;
             break;
         }
         }
         break;
+    case WM_TIMER:
+        if (wParam == 1) {
+            ProcessVideoFrame(hwnd);
+        }
+        break;
     case WM_DESTROY:
-        if (!currentImage.empty()) currentImage.release();
+        if (cap.isOpened()) cap.release();
+        KillTimer(hwnd, 1);
         PostQuitMessage(0);
         break;
     default:
@@ -477,7 +501,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     std::string exeDir = GetExecutableDirectory();
-    std::string modelPath = exeDir + "best.onnx"; // Assumes model is named yolov11m.onnx
+    std::string modelPath = exeDir + "best.onnx";
 
     if (!InitializeModel(modelPath.c_str())) {
         MessageBoxW(NULL, L"Failed to initialize model! Ensure yolov11m.onnx is in the same directory as the executable.",
